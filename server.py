@@ -1,13 +1,23 @@
+import socketio
+import asyncio
+from aiohttp import web
+import random
+import string
 import time
 import logging
 
-# Configure logging to output to console with timestamps
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Initialize Async Socket.IO server
+sio = socketio.AsyncServer(cors_allowed_origins='*', async_mode='aiohttp')
+app = web.Application()
+sio.attach(app)
 
 # Game state
 rooms = {}
