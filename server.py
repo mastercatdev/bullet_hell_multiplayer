@@ -101,13 +101,20 @@ async def handle_ws(request):
                                 for p in players.values():
                                     p['dead'] = False
                                     p['death_time'] = None
+                                    p['ready'] = False
                                 rooms[code]['started'] = True
                                 boss_id = random.choice([1, 2, 3])
                                 seed = random.randint(0, 1000000)
                                 await broadcast(code, 'game_start', {'boss_id': boss_id, 'seed': seed})
+                                await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players'])})
                                 logger.info(f"Game started in room {code} (Boss: {boss_id}, Seed: {seed})")
                             else:
                                 await ws.send_json({'type': 'error', 'data': {'message': 'Need 2+ players and everyone must choose an ability'}})
+                                
+                    elif event == 'admin_set_phase':
+                        code = data.get('code')
+                        if code in rooms:
+                            await broadcast(code, 'set_phase', {'phase': data.get('phase')})
                                 
                     elif event == 'player_update':
                         code = data.get('code')
