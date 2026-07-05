@@ -103,7 +103,7 @@ async def handle_ws(request):
                                     p['death_time'] = None
                                     p['ready'] = False
                                 rooms[code]['started'] = True
-                                boss_id = random.choice([1, 2, 3])
+                                boss_id = random.choice([1, 2, 3, 4, 5])
                                 seed = random.randint(0, 1000000)
                                 await broadcast(code, 'game_start', {'boss_id': boss_id, 'seed': seed})
                                 await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players'])})
