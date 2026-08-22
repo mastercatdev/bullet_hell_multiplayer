@@ -140,7 +140,10 @@ async def handle_ws(request):
                                 'sid': sid,
                                 'pos': data.get('pos'),
                                 'hp': data.get('hp'),
-                                'dead': data.get('dead', False)
+                                'dead': data.get('dead', False),
+                                'skin': data.get('skin'),
+                                'shield': data.get('shield', False),
+                                'wall': data.get('wall')
                             }, exclude_sid=sid)
                             
                     elif event == 'slow_mo_update':
