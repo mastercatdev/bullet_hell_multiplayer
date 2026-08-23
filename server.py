@@ -18,6 +18,15 @@ app = web.Application()
 # Game state
 rooms = {}
 
+MAX_PLAYERS = 4
+
+# Coop: the boss gets tougher with party size, but SUB-linearly, so a team
+# out-damages it. That is the point of coop - it lets you attempt a boss
+# above your own rating, with the contribution-weighted rating award
+# stopping it from being a free ride.
+def coop_hp_scale(n):
+    return 1.0 + 0.6 * (max(1, n) - 1)
+
 def generate_code():
     return ''.join(random.choices(string.digits, k=4))
 
@@ -26,6 +35,12 @@ def _clean_players(players_dict):
     for k, v in players_dict.items():
         res[k] = {k2: v2 for k2, v2 in v.items() if k2 != 'ws'}
     return res
+
+def _room_config(room):
+    return {'mode': room.get('mode', 'versus'),
+            'boss_id': room.get('boss_id', 1),
+            'starting_hp': room.get('starting_hp', 5)}
+
 
 async def broadcast(code, event, data, exclude_sid=None):
     if code in rooms:
@@ -60,11 +75,15 @@ async def handle_ws(request):
                         
                         rooms[code] = {
                             'players': {
-                                sid: {'name': username, 'ability': 'none', 'ready': False, 'is_host': True, 'ws': ws}
+                                sid: {'name': username, 'ability': 'none', 'pclass': 'base', 'rating': 0, 'ready': False, 'is_host': True, 'ws': ws}
                             },
-                            'started': False
+                            'started': False,
+                            'mode': 'versus',       # 'versus' | 'coop'
+                            'boss_id': 1,
+                            'starting_hp': 5,
+                            'coop': None,
                         }
-                        await ws.send_json({'type': 'room_created', 'data': {'code': code, 'players': _clean_players(rooms[code]['players'])}})
+                        await ws.send_json({'type': 'room_created', 'data': {'code': code, 'players': _clean_players(rooms[code]['players']), 'config': _room_config(rooms[code])}})
                         logger.info(f"Room {code} created by {username} ({sid})")
                         
                     elif event == 'join_room':
@@ -74,10 +93,12 @@ async def handle_ws(request):
                         if code in rooms:
                             if rooms[code]['started']:
                                 await ws.send_json({'type': 'error', 'data': {'message': 'Game already started'}})
+                            elif len(rooms[code]['players']) >= MAX_PLAYERS:
+                                await ws.send_json({'type': 'error', 'data': {'message': f'Room is full ({MAX_PLAYERS} players max)'}})
                             else:
-                                rooms[code]['players'][sid] = {'name': username, 'ability': 'none', 'ready': False, 'is_host': False, 'ws': ws}
-                                await ws.send_json({'type': 'joined_room', 'data': {'code': code, 'players': _clean_players(rooms[code]['players'])}})
-                                await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players'])})
+                                rooms[code]['players'][sid] = {'name': username, 'ability': 'none', 'pclass': 'base', 'rating': 0, 'ready': False, 'is_host': False, 'ws': ws}
+                                await ws.send_json({'type': 'joined_room', 'data': {'code': code, 'players': _clean_players(rooms[code]['players']), 'config': _room_config(rooms[code])}})
+                                await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players']), 'config': _room_config(rooms[code])})
                                 logger.info(f"Player {username} ({sid}) joined room {code}")
                         else:
                             await ws.send_json({'type': 'error', 'data': {'message': 'Invalid room code'}})
@@ -90,26 +111,112 @@ async def handle_ws(request):
                         if code in rooms and sid in rooms[code]['players']:
                             rooms[code]['players'][sid]['ability'] = ability
                             rooms[code]['players'][sid]['ready'] = ready
+                            if 'pclass' in data:
+                                rooms[code]['players'][sid]['pclass'] = data.get('pclass', 'base')
+                            if 'rating' in data:
+                                # Coop gates on the party's LOWEST rating, so every
+                                # member reports theirs to the lobby.
+                                try:
+                                    rooms[code]['players'][sid]['rating'] = int(data.get('rating', 0))
+                                except (TypeError, ValueError):
+                                    rooms[code]['players'][sid]['rating'] = 0
                             logger.debug(f"Lobby {code}: {rooms[code]['players'][sid]['name']} is {'READY' if ready else 'NOT READY'} ({ability})")
-                            await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players'])})
+                            await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players']), 'config': _room_config(rooms[code])})
                             
+                    elif event == 'update_room_config':
+                        # Host only: coop/versus, and for coop the boss and team HP.
+                        code = data.get('code')
+                        if code in rooms and rooms[code]['players'].get(sid, {}).get('is_host'):
+                            room = rooms[code]
+                            if 'mode' in data:        room['mode'] = 'coop' if data['mode'] == 'coop' else 'versus'
+                            if 'boss_id' in data:     room['boss_id'] = max(1, min(5, int(data['boss_id'])))
+                            if 'starting_hp' in data: room['starting_hp'] = max(1, min(5, int(data['starting_hp'])))
+                            await broadcast(code, 'lobby_update', {'players': _clean_players(room['players']), 'config': _room_config(room)})
+
                     elif event == 'start_game':
                         code = data.get('code')
                         if code in rooms and rooms[code]['players'][sid]['is_host']:
-                            players = rooms[code]['players']
+                            room = rooms[code]
+                            players = room['players']
                             if len(players) >= 2 and all(p['ready'] for p in players.values()):
                                 for p in players.values():
                                     p['dead'] = False
                                     p['death_time'] = None
                                     p['ready'] = False
-                                rooms[code]['started'] = True
-                                boss_id = random.choice([1, 2, 3, 4, 5])
+                                room['started'] = True
                                 seed = random.randint(0, 1000000)
-                                await broadcast(code, 'game_start', {'boss_id': boss_id, 'seed': seed})
-                                await broadcast(code, 'lobby_update', {'players': _clean_players(rooms[code]['players'])})
-                                logger.info(f"Game started in room {code} (Boss: {boss_id}, Seed: {seed})")
+                                n = len(players)
+                                if room.get('mode') == 'coop':
+                                    boss_id = room.get('boss_id', 1)
+                                    team_hp = room.get('starting_hp', 5)
+                                    room['coop'] = {
+                                        'boss_hp': None,      # filled by the first damage report
+                                        'boss_max': None,
+                                        'team_hp': team_hp,
+                                        'contrib': {s: 0.0 for s in players},
+                                        'over': False,
+                                    }
+                                    payload = {
+                                        'boss_id': boss_id, 'seed': seed, 'mode': 'coop',
+                                        'starting_hp': team_hp, 'players': n,
+                                        'hp_scale': coop_hp_scale(n),
+                                        'classes': {s: p.get('pclass', 'base') for s, p in players.items()},
+                                    }
+                                else:
+                                    boss_id = random.choice([1, 2, 3, 4, 5])
+                                    payload = {'boss_id': boss_id, 'seed': seed, 'mode': 'versus', 'players': n}
+                                await broadcast(code, 'game_start', payload)
+                                await broadcast(code, 'lobby_update', {'players': _clean_players(players), 'config': _room_config(room)})
+                                logger.info(f"Game started in room {code} (mode={room.get('mode')}, Boss: {boss_id}, Seed: {seed}, n={n})")
                             else:
-                                await ws.send_json({'type': 'error', 'data': {'message': 'Need 2+ players and everyone must choose an ability'}})
+                                await ws.send_json({'type': 'error', 'data': {'message': 'Need 2+ players and everyone must be ready'}})
+
+                    elif event == 'boss_damage':
+                        # Coop: the server owns boss HP so every client agrees when
+                        # it dies, and so damage contribution is a shared quantity.
+                        code = data.get('code')
+                        room = rooms.get(code)
+                        if room and room.get('coop') and not room['coop']['over']:
+                            co = room['coop']
+                            if co['boss_max'] is None:
+                                co['boss_max'] = float(data.get('boss_max', 1000))
+                                co['boss_hp'] = co['boss_max']
+                            dmg = max(0.0, float(data.get('dmg', 0)))
+                            co['boss_hp'] = max(0.0, co['boss_hp'] - dmg)
+                            co['contrib'][sid] = co['contrib'].get(sid, 0.0) + dmg
+                            await broadcast(code, 'coop_state', {
+                                'boss_hp': co['boss_hp'], 'boss_max': co['boss_max'],
+                                'team_hp': co['team_hp'], 'contrib': co['contrib']})
+                            if co['boss_hp'] <= 0:
+                                co['over'] = True
+                                room['started'] = False
+                                await broadcast(code, 'coop_over', {
+                                    'win': True, 'contrib': co['contrib'],
+                                    'names': {s: p['name'] for s, p in room['players'].items()}})
+                                logger.info(f"Coop win in room {code}")
+
+                    elif event == 'team_hit':
+                        # Shared HP pool: any player taking a hit drains the team.
+                        code = data.get('code')
+                        room = rooms.get(code)
+                        if room and room.get('coop') and not room['coop']['over']:
+                            co = room['coop']
+                            try:
+                                n_lost = max(1, int(data.get('n', 1)))
+                            except (TypeError, ValueError):
+                                n_lost = 1
+                            co['team_hp'] = max(0, co['team_hp'] - n_lost)
+                            await broadcast(code, 'coop_state', {
+                                'boss_hp': co['boss_hp'] if co['boss_hp'] is not None else 0,
+                                'boss_max': co['boss_max'] if co['boss_max'] is not None else 1,
+                                'team_hp': co['team_hp'], 'contrib': co['contrib']})
+                            if co['team_hp'] <= 0:
+                                co['over'] = True
+                                room['started'] = False
+                                await broadcast(code, 'coop_over', {
+                                    'win': False, 'contrib': co['contrib'],
+                                    'names': {s: p['name'] for s, p in room['players'].items()}})
+                                logger.info(f"Coop wipe in room {code}")
                                 
                     elif event == 'admin_set_phase':
                         code = data.get('code')
